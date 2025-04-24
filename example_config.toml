@@ -1,0 +1,26 @@
+# Corky Telegram Bot Configuration
+# Copy the contents of this file to ~/.corky/config.toml and modify as needed
+
+[telegram]
+# Your Telegram bot token (obtained from BotFather)
+bot_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Default chat ID to send messages to when no chat_id is specified in ZMQ command
+# This should be your personal chat ID with the bot (use /id command to get it)
+owner_chat_id = 123456789
+
+# ZMQ endpoint for client-to-client communication
+# This should match the client_to_client_endpoint in your ZMQ proxy
+zmq_endpoint = "tcp://127.0.0.1:6565"
+
+# Subscriber lists - groups of chat IDs that can be targeted by name in ZMQ commands
+# Format: list_name = [chat_id1, chat_id2, ...]
+[telegram.subscriber_lists]
+# Friends list example
+friends = [123456789, 987654321]
+
+# Family members list example
+family = [123456789, 111222333, 444555666]
+
+# Team members list example
+team = [123456789, 222333444, 555666777, 888999000]

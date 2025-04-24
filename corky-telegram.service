@@ -1,0 +1,16 @@
+[Unit]
+Description=Corky Telegram ZMQ Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%WORK_DIR%
+ExecStart=%WORK_DIR%/target/release/corky-telegram
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=corky-telegram
+
+[Install]
+WantedBy=default.target
