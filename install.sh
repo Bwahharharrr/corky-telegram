@@ -185,7 +185,7 @@ WantedBy=default.target
 EOF
 else
     # System-level service with all security options
-    sed -e "s|%USER%|$CURRENT_USER|g" \
+    sed -e "s|%USER%|$REAL_USER|g" \
         -e "s|%WORK_DIR%|$WORK_DIR|g" \
         corky-telegram.service > /tmp/corky-telegram.service
 fi

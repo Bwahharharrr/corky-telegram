@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=%USER%
+Group=%USER%
 WorkingDirectory=%WORK_DIR%
 ExecStart=%WORK_DIR%/target/release/corky-telegram
 Restart=always
