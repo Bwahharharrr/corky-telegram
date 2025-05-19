@@ -14,8 +14,17 @@ echo -e "${GREEN}Installing Corky Telegram Bot service...${NC}"
 CURRENT_USER=$(whoami)
 WORK_DIR=$(pwd)
 
+# Get the real user's home directory, even when run with sudo
+if [ -n "$SUDO_USER" ]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(eval echo ~$SUDO_USER)
+else
+    REAL_USER="$CURRENT_USER"
+    REAL_HOME="$HOME"
+fi
+
 # Handle config file setup
-CONFIG_DIR="$HOME/.corky"
+CONFIG_DIR="$REAL_HOME/.corky"
 CONFIG_PATH="$CONFIG_DIR/config.toml"
 EXAMPLE_CONFIG="$WORK_DIR/example_config.toml"
 
@@ -23,12 +32,20 @@ EXAMPLE_CONFIG="$WORK_DIR/example_config.toml"
 if [ ! -d "$CONFIG_DIR" ]; then
     echo -e "${YELLOW}Creating config directory at $CONFIG_DIR${NC}"
     mkdir -p "$CONFIG_DIR"
+    # If we're running as root, ensure the directory is owned by the real user
+    if [ "$EUID" -eq 0 ]; then
+        chown "$REAL_USER" "$CONFIG_DIR"
+    fi
 fi
 
 # Check if config file exists
 if [ ! -f "$CONFIG_PATH" ]; then
     echo -e "${YELLOW}Config file not found. Creating from example_config.toml...${NC}"
     cp "$EXAMPLE_CONFIG" "$CONFIG_PATH"
+    # If we're running as root, ensure the config file is owned by the real user
+    if [ "$EUID" -eq 0 ]; then
+        chown "$REAL_USER" "$CONFIG_PATH"
+    fi
     echo -e "${GREEN}Created config file at $CONFIG_PATH${NC}"
     echo -e "${YELLOW}You must edit this file with your actual Telegram bot token and chat IDs before continuing.${NC}"
     echo -e "${YELLOW}You can edit it with: nano $CONFIG_PATH${NC}"
