@@ -3,6 +3,15 @@ name = "corky-telegram"
 version = "0.1.0"
 edition = "2021"
 
+[banner]
+ascii = """
+\\033[1;35mO--O--O--O
+   \\033[1;37m|  Messages  |
+\\033[1;36mO--O--O--O
+\\033[0;34m   Corky Telegram\\033[0m
+"""
+
+
 [dependencies]
 teloxide = { version = "0.15.0", features = ["macros"] }
 tokio     = { version = "1.8", features = ["macros", "rt-multi-thread"] }
@@ -14,3 +23,8 @@ zmq       = "0.10"
 toml      = "0.7"
 dirs      = "5.0"
 chrono    = "0.4"
+
+
+[corky] 
+is_corky_package = true
+
