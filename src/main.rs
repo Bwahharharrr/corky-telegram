@@ -5,7 +5,7 @@ use chrono::Local;
 use std::{fs, path::PathBuf, collections::HashMap, thread};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::{signal, sync::mpsc, time};
+use tokio::{signal, sync::{mpsc, Notify}, time};
 
 /// Safely truncate a string to at most `max_chars` characters,
 /// never splitting a multi-byte UTF-8 character.
@@ -125,13 +125,12 @@ struct ZmqMessage {
 /// Events sent to the central channel
 enum Event {
     Zmq(Vec<Vec<u8>>),
-    Shutdown,
 }
 
 /// Parse and handle raw ZMQ frames
 async fn handle_zmq_frames(
-    bot: &Bot,
-    settings: &config::TelegramSettings,
+    bot: Bot,
+    settings: config::TelegramSettings,
     frames: Vec<Vec<u8>>,
 ) {
     if frames.len() < 2 {
@@ -166,7 +165,7 @@ async fn handle_zmq_frames(
                         match serde_json::from_value::<ZmqMessage>(arr[2].clone()) {
                             Ok(cmd) => {
                                 info!("ZMQ: Successfully extracted command: {:?}", cmd);
-                                process_zmq_message(bot, settings, cmd).await
+                                process_zmq_message(&bot, &settings, cmd).await
                             },
                             Err(err) => error!("Invalid command structure: {:?}", err),
                         }
@@ -200,13 +199,20 @@ async fn process_zmq_message(
         }
     } else if let Some(list_name) = &cmd.subscriber_list {
         if let Some(subs) = settings.subscriber_lists.get(list_name) {
+            let mut tasks = tokio::task::JoinSet::new();
             for &sub_id in subs {
-                if let Some(img_path) = &cmd.image_path {
-                    send_to_chat_with_image_retry(bot, ChatId(sub_id), &cmd.text, img_path).await;
-                } else {
-                    send_to_chat_with_retry(bot, ChatId(sub_id), &cmd.text).await;
-                }
+                let bot = bot.clone();
+                let text = cmd.text.clone();
+                let image_path = cmd.image_path.clone();
+                tasks.spawn(async move {
+                    if let Some(img_path) = &image_path {
+                        send_to_chat_with_image_retry(&bot, ChatId(sub_id), &text, img_path).await;
+                    } else {
+                        send_to_chat_with_retry(&bot, ChatId(sub_id), &text).await;
+                    }
+                });
             }
+            while tasks.join_next().await.is_some() {}
         } else {
             warn!("Subscriber list '{}' not found", list_name);
             send_to_chat_with_retry(
@@ -322,24 +328,24 @@ fn setup_logger() {
         fn log(&self, record: &Record) {
             if self.enabled(record.metadata()) {
                 let timestamp = Local::now().format("%H:%M:%S").to_string();
-                
+                let message = record.args().to_string();
+
                 // Color coding based on message type and level
                 let (color_code, prefix) = match record.level() {
                     Level::Error => ("\x1b[31m", "ERROR"), // Red for errors
                     Level::Warn => ("\x1b[33m", "WARN "), // Yellow for warnings
                     Level::Info => {
-                        let msg = record.args().to_string();
-                        if msg.contains("ZMQ:") {
-                            if msg.contains("received message") || msg.contains("Received message") {
+                        if message.contains("ZMQ:") {
+                            if message.contains("received message") || message.contains("Received message") {
                                 ("\x1b[36m", "ZMQ ") // Cyan for ZMQ received messages
                             } else {
                                 ("\x1b[90m", "ZMQ ") // Dark gray for other ZMQ messages
                             }
-                        } else if msg.contains("telegram") || msg.contains("bot") {
+                        } else if message.contains("telegram") || message.contains("bot") {
                             ("\x1b[32m", "BOT ") // Green for bot-related messages
-                        } else if msg.contains("Processing") || msg.contains("command") {
+                        } else if message.contains("Processing") || message.contains("command") {
                             ("\x1b[35m", "CMD ") // Magenta for command processing
-                        } else if msg.contains("Sent message") {
+                        } else if message.contains("Sent message") {
                             ("\x1b[34m", "MSG ") // Blue for sent messages
                         } else {
                             ("\x1b[0m", "INFO") // Default for other info messages
@@ -347,12 +353,9 @@ fn setup_logger() {
                     }
                     _ => ("\x1b[0m", "INFO"), // Default color for other levels
                 };
-                
+
                 // Reset color code at the end
                 let reset_code = "\x1b[0m";
-                
-                // Filter and condense ZMQ debug messages
-                let message = record.args().to_string();
                 let log_message = if message.contains("ZMQ:") {
                     // For ZMQ messages, extract just the important parts
                     if message.contains("poll detected") || message.contains("entering") || 
@@ -372,9 +375,9 @@ fn setup_logger() {
                             if let Some(text_start) = content.find("\"text\":") {
                                 let text_content = content.get(text_start + 8..).unwrap_or("");
                                 if let Some(end) = text_content.find("\",") {
-                                    format!("Content: {}", &text_content[..end])
+                                    format!("Content: {}", text_content.get(..end).unwrap_or(text_content))
                                 } else if let Some(end) = text_content.find("\"}") {
-                                    format!("Content: {}", &text_content[..end])
+                                    format!("Content: {}", text_content.get(..end).unwrap_or(text_content))
                                 } else {
                                     format!("Message: {}", content)
                                 }
@@ -446,10 +449,10 @@ async fn main() {
         let shutdown = shutdown_flag.clone();
         thread::spawn(move || {
             info!("ZMQ: Starting listener thread");
+            let context = zmq::Context::new();
 
             // Outer reconnection loop
-            while !shutdown.load(Ordering::Relaxed) {
-                let context = zmq::Context::new();
+            while !shutdown.load(Ordering::Acquire) {
                 let socket = match context.socket(zmq::DEALER) {
                     Ok(s) => s,
                     Err(e) => {
@@ -499,7 +502,7 @@ async fn main() {
                 let max_consecutive_errors = 10;
 
                 // Inner polling loop - runs until max consecutive errors or shutdown
-                while consecutive_errors < max_consecutive_errors && !shutdown.load(Ordering::Relaxed) {
+                while consecutive_errors < max_consecutive_errors && !shutdown.load(Ordering::Acquire) {
                     // Poll with timeout (5 seconds - allows for periodic health checks)
                     match zmq::poll(&mut items, 5000) {
                         Ok(0) => {
@@ -512,9 +515,23 @@ async fn main() {
                                 match socket.recv_multipart(0) {
                                     Ok(frames) => {
                                         info!("ZMQ: Received message with {} frames", frames.len());
-                                        if tx.blocking_send(Event::Zmq(frames)).is_err() {
-                                            info!("ZMQ: Channel closed, shutting down");
-                                            return;
+                                        let mut event = Event::Zmq(frames);
+                                        loop {
+                                            match tx.try_send(event) {
+                                                Ok(()) => break,
+                                                Err(mpsc::error::TrySendError::Full(returned)) => {
+                                                    if shutdown.load(Ordering::Acquire) {
+                                                        info!("ZMQ: Shutdown during channel-full, exiting");
+                                                        return;
+                                                    }
+                                                    event = returned;
+                                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    info!("ZMQ: Channel closed, shutting down");
+                                                    return;
+                                                }
+                                            }
                                         }
                                         consecutive_errors = 0;
                                     }
@@ -532,7 +549,7 @@ async fn main() {
                     }
                 }
 
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Acquire) {
                     break;
                 }
 
@@ -540,7 +557,6 @@ async fn main() {
                 error!("ZMQ: Too many consecutive errors ({}), reconnecting...", max_consecutive_errors);
                 let _ = socket.disconnect(&endpoint);
                 drop(socket);
-                drop(context);
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
 
@@ -548,12 +564,18 @@ async fn main() {
         })
     };
 
+    // Shutdown notification for instant signaling
+    let shutdown_notify = Arc::new(Notify::new());
+
     // Spawn CTRL+C handler
     {
-        let tx = tx.clone();
+        let shutdown_flag = shutdown_flag.clone();
+        let shutdown_notify = shutdown_notify.clone();
         tokio::spawn(async move {
             if signal::ctrl_c().await.is_ok() {
-                let _ = tx.send(Event::Shutdown).await;
+                info!("CTRL+C received; initiating shutdown");
+                shutdown_flag.store(true, Ordering::Release);
+                shutdown_notify.notify_one();
             }
         });
     }
@@ -563,23 +585,46 @@ async fn main() {
         .filter_command::<commands::Command>()
         .endpoint(commands::handle);
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler).build();
-    let _dispatch_task = tokio::spawn(async move {
+    let dispatch_shutdown = dispatcher.shutdown_token();
+    let dispatch_task = tokio::spawn(async move {
         dispatcher.dispatch().await;
     });
 
-    // Central event loop: handle ZMQ messages or shutdown
-    while let Some(event) = rx.recv().await {
-        match event {
-            Event::Zmq(frames) => handle_zmq_frames(&bot, &settings, frames).await,
-            Event::Shutdown => {
-                info!("Shutdown event received; exiting");
+    // Central event loop: handle ZMQ messages or shutdown via select!
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                info!("Shutdown signal received; exiting event loop");
                 break;
+            }
+            event = rx.recv() => {
+                match event {
+                    Some(Event::Zmq(frames)) => {
+                        let bot = bot.clone();
+                        let settings = settings.clone();
+                        tokio::spawn(async move {
+                            handle_zmq_frames(bot, settings, frames).await;
+                        });
+                    }
+                    None => {
+                        info!("Event channel closed; exiting event loop");
+                        break;
+                    }
+                }
             }
         }
     }
 
+    // Shut down the Telegram dispatcher gracefully
+    if let Ok(fut) = dispatch_shutdown.shutdown() {
+        if time::timeout(time::Duration::from_secs(10), fut).await.is_err() {
+            warn!("Telegram dispatcher shutdown timed out");
+        }
+    }
+    dispatch_task.abort();
+
     // Signal the ZMQ thread to stop and wait for it
-    shutdown_flag.store(true, Ordering::Relaxed);
+    shutdown_flag.store(true, Ordering::Release);
     info!("Waiting for ZMQ thread to exit...");
     if let Err(e) = zmq_handle.join() {
         error!("ZMQ thread panicked: {:?}", e);
