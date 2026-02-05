@@ -1,14 +1,23 @@
 use teloxide::{prelude::*, types::InputFile};
 use serde::Deserialize;
-use zmq;
 use log::{error, info, warn, trace, Level, LevelFilter, Metadata, Record};
 use chrono::Local;
 use std::{fs, path::PathBuf, collections::HashMap, thread};
-use tokio::{signal, sync::mpsc::{unbounded_channel}, time};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::{signal, sync::mpsc, time};
+
+/// Safely truncate a string to at most `max_chars` characters,
+/// never splitting a multi-byte UTF-8 character.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
 
 mod config {
     use super::*;
-    use dirs;
 
     /// Application configuration loaded from TOML
     #[derive(Deserialize, Debug, Clone)]
@@ -152,8 +161,7 @@ async fn handle_zmq_frames(
     if let Ok(payload) = std::str::from_utf8(&frames[1]) {
         match serde_json::from_str::<serde_json::Value>(payload) {
             Ok(val) => {
-                if val.is_array() {
-                    let arr = val.as_array().unwrap();
+                if let Some(arr) = val.as_array() {
                     if arr.len() >= 3 {
                         match serde_json::from_value::<ZmqMessage>(arr[2].clone()) {
                             Ok(cmd) => {
@@ -201,13 +209,16 @@ async fn process_zmq_message(
             }
         } else {
             warn!("Subscriber list '{}' not found", list_name);
+            send_to_chat_with_retry(
+                bot,
+                ChatId(settings.owner_chat_id),
+                &format!("Warning: unknown subscriber list '{}'", list_name),
+            ).await;
         }
+    } else if let Some(img_path) = &cmd.image_path {
+        send_to_chat_with_image_retry(bot, ChatId(settings.owner_chat_id), &cmd.text, img_path).await;
     } else {
-        if let Some(img_path) = &cmd.image_path {
-            send_to_chat_with_image_retry(bot, ChatId(settings.owner_chat_id), &cmd.text, img_path).await;
-        } else {
-            send_to_chat_with_retry(bot, ChatId(settings.owner_chat_id), &cmd.text).await;
-        }
+        send_to_chat_with_retry(bot, ChatId(settings.owner_chat_id), &cmd.text).await;
     }
 }
 
@@ -217,20 +228,29 @@ async fn send_to_chat_with_retry(bot: &Bot, chat: ChatId, text: &str) {
     const BASE_DELAY_MS: u64 = 500;
     
     for attempt in 0..MAX_RETRIES {
-        match bot.send_message(chat, text).await {
-            Ok(_) => {
-                info!("Sent message to {}: \"{}\"", chat, if text.len() > 30 { format!("{}...", &text[0..30]) } else { text.to_string() });
-                return; // Success, exit function
+        match time::timeout(
+            time::Duration::from_secs(30),
+            bot.send_message(chat, text),
+        ).await {
+            Ok(Ok(_)) => {
+                info!("Sent message to {}: \"{}\"", chat, if text.len() > 30 { format!("{}...", truncate_str(text, 30)) } else { text.to_string() });
+                return;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 if attempt < MAX_RETRIES - 1 {
-                    // Calculate exponential backoff delay
                     let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32));
-                    warn!("Failed to send to {} (attempt {}/{}): {:?}, retrying in {}ms", 
+                    warn!("Failed to send to {} (attempt {}/{}): {:?}, retrying in {}ms",
                           chat, attempt + 1, MAX_RETRIES, err, delay);
                     time::sleep(time::Duration::from_millis(delay)).await;
                 } else {
                     error!("Failed to send to {} after {} attempts: {:?}", chat, MAX_RETRIES, err);
+                }
+            }
+            Err(_elapsed) => {
+                if attempt < MAX_RETRIES - 1 {
+                    warn!("Timeout sending to {} (attempt {}/{}), retrying", chat, attempt + 1, MAX_RETRIES);
+                } else {
+                    error!("Timeout sending to {} after {} attempts", chat, MAX_RETRIES);
                 }
             }
         }
@@ -251,27 +271,37 @@ async fn send_to_chat_with_image_retry(bot: &Bot, chat: ChatId, text: &str, imag
     }
 
     for attempt in 0..MAX_RETRIES {
-        let path = PathBuf::from(image_path); // Create a new path for each attempt
+        let path = PathBuf::from(image_path);
         let input_file = InputFile::file(path);
-        
-        match bot.send_photo(chat, input_file.clone()).caption(text).await {
-            Ok(_) => {
-                info!("Sent image message to {}: \"{}\" with image {}", 
-                      chat, 
-                      if text.len() > 30 { format!("{}...", &text[0..30]) } else { text.to_string() },
+
+        match time::timeout(
+            time::Duration::from_secs(60),
+            bot.send_photo(chat, input_file.clone()).caption(text),
+        ).await {
+            Ok(Ok(_)) => {
+                info!("Sent image message to {}: \"{}\" with image {}",
+                      chat,
+                      if text.len() > 30 { format!("{}...", truncate_str(text, 30)) } else { text.to_string() },
                       image_path);
-                return; // Success, exit function
+                return;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 if attempt < MAX_RETRIES - 1 {
-                    // Calculate exponential backoff delay
                     let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32));
-                    warn!("Failed to send image to {} (attempt {}/{}): {:?}, retrying in {}ms", 
+                    warn!("Failed to send image to {} (attempt {}/{}): {:?}, retrying in {}ms",
                           chat, attempt + 1, MAX_RETRIES, err, delay);
                     time::sleep(time::Duration::from_millis(delay)).await;
                 } else {
                     error!("Failed to send image to {} after {} attempts: {:?}", chat, MAX_RETRIES, err);
-                    // Try to send just the text as fallback
+                    warn!("Falling back to text-only message");
+                    send_to_chat_with_retry(bot, chat, &format!("{} (Image attachment failed: {})", text, image_path)).await;
+                }
+            }
+            Err(_elapsed) => {
+                if attempt < MAX_RETRIES - 1 {
+                    warn!("Timeout sending image to {} (attempt {}/{}), retrying", chat, attempt + 1, MAX_RETRIES);
+                } else {
+                    error!("Timeout sending image to {} after {} attempts", chat, MAX_RETRIES);
                     warn!("Falling back to text-only message");
                     send_to_chat_with_retry(bot, chat, &format!("{} (Image attachment failed: {})", text, image_path)).await;
                 }
@@ -329,15 +359,18 @@ fn setup_logger() {
                        message.contains("poll error") || message.contains("timeout") {
                         // Skip verbose polling messages
                         return;
-                    } else if message.contains("Frame 0:") {
+                    } else if let Some(idx) = message.find("Frame 0:") {
                         // For frame logging, condense to show just the sender
-                        format!("From: {}", message.split_at(message.find("Frame 0:").unwrap() + 8).1.trim())
+                        format!("From: {}", message.get(idx + 8..).unwrap_or("").trim())
                     } else if message.contains("Frame 1:") && message.contains("send_message") {
                         // For message content, extract key parts to make it more readable
-                        let content = message.split_at(message.find("Frame 1:").unwrap() + 8).1.trim();
+                        let content = message.find("Frame 1:")
+                            .and_then(|idx| message.get(idx + 8..))
+                            .unwrap_or("")
+                            .trim();
                         if content.contains("text") {
                             if let Some(text_start) = content.find("\"text\":") {
-                                let text_content = &content[text_start + 8..];
+                                let text_content = content.get(text_start + 8..).unwrap_or("");
                                 if let Some(end) = text_content.find("\",") {
                                     format!("Content: {}", &text_content[..end])
                                 } else if let Some(end) = text_content.find("\"}") {
@@ -353,8 +386,11 @@ fn setup_logger() {
                         }
                     } else if message.contains("Successfully extracted command") {
                         // Extract just the command details
-                        let cmd_start = message.find("command:").unwrap_or(0) + 8;
-                        format!("Command: {}", message[cmd_start..].trim())
+                        if let Some(idx) = message.find("command:") {
+                            format!("Command: {}", message.get(idx + 8..).unwrap_or("").trim())
+                        } else {
+                            message.clone()
+                        }
                     } else if message.contains("Processing ZMQ message") {
                         // Extract just the essential parts
                         "Processing message".to_string()
@@ -397,18 +433,22 @@ async fn main() {
     // Create bot
     let bot = Bot::new(&settings.bot_token);
 
-    // Central event channel
-    let (tx, mut rx) = unbounded_channel::<Event>();
+    // Central event channel (bounded to prevent unbounded memory growth)
+    let (tx, mut rx) = mpsc::channel::<Event>(256);
+
+    // Shutdown flag shared with the ZMQ thread
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     // Spawn ZMQ listener in a dedicated thread
-    {
+    let zmq_handle = {
         let tx = tx.clone();
         let endpoint = settings.zmq_endpoint.clone();
+        let shutdown = shutdown_flag.clone();
         thread::spawn(move || {
             info!("ZMQ: Starting listener thread");
-            
+
             // Outer reconnection loop
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 let context = zmq::Context::new();
                 let socket = match context.socket(zmq::DEALER) {
                     Ok(s) => s,
@@ -418,7 +458,7 @@ async fn main() {
                         continue;
                     }
                 };
-                
+
                 // Set identity exactly like the Python script
                 let identity = b"telegram".to_vec();
                 if let Err(e) = socket.set_identity(&identity) {
@@ -426,7 +466,7 @@ async fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     continue;
                 }
-                
+
                 info!("ZMQ: DEALER socket connecting to {}", endpoint);
                 match socket.connect(&endpoint) {
                     Ok(_) => info!("ZMQ: Successfully connected to {}", endpoint),
@@ -436,36 +476,35 @@ async fn main() {
                         continue;
                     }
                 }
-                
+
                 // Set socket options for better reliability
                 if let Err(e) = socket.set_linger(0) {
                     warn!("Failed to set ZMQ linger option: {:?}", e);
                 }
-                
+
                 if let Err(e) = socket.set_reconnect_ivl(1000) {
                     warn!("Failed to set ZMQ reconnect interval: {:?}", e);
                 }
-                
+
                 if let Err(e) = socket.set_reconnect_ivl_max(30000) {
                     warn!("Failed to set ZMQ max reconnect interval: {:?}", e);
                 }
-                
+
                 // Create items for polling, similar to Python implementation
                 let mut items = [socket.as_poll_item(zmq::POLLIN)];
                 info!("ZMQ: Entering polling loop");
-                
+
                 // Connection health check tracker
                 let mut consecutive_errors = 0;
                 let max_consecutive_errors = 10;
-                
-                // Inner polling loop - runs until max consecutive errors
-                while consecutive_errors < max_consecutive_errors {
+
+                // Inner polling loop - runs until max consecutive errors or shutdown
+                while consecutive_errors < max_consecutive_errors && !shutdown.load(Ordering::Relaxed) {
                     // Poll with timeout (5 seconds - allows for periodic health checks)
                     match zmq::poll(&mut items, 5000) {
                         Ok(0) => {
-                            // No events, just a timeout - send a heartbeat to check connection
+                            // No events, just a timeout
                             trace!("ZMQ: Poll timeout, connection still alive");
-                            consecutive_errors = 0; // Reset error counter on successful poll
                         },
                         Ok(_) => {
                             // Check if our socket has data
@@ -473,8 +512,11 @@ async fn main() {
                                 match socket.recv_multipart(0) {
                                     Ok(frames) => {
                                         info!("ZMQ: Received message with {} frames", frames.len());
-                                        let _ = tx.send(Event::Zmq(frames));
-                                        consecutive_errors = 0; // Reset error counter on success
+                                        if tx.blocking_send(Event::Zmq(frames)).is_err() {
+                                            info!("ZMQ: Channel closed, shutting down");
+                                            return;
+                                        }
+                                        consecutive_errors = 0;
                                     }
                                     Err(err) => {
                                         error!("ZMQ recv error: {:?}", err);
@@ -489,7 +531,11 @@ async fn main() {
                         }
                     }
                 }
-                
+
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 // If we reached max consecutive errors, close socket and reconnect
                 error!("ZMQ: Too many consecutive errors ({}), reconnecting...", max_consecutive_errors);
                 let _ = socket.disconnect(&endpoint);
@@ -497,15 +543,17 @@ async fn main() {
                 drop(context);
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
-        });
-    }
+
+            info!("ZMQ: Listener thread exiting");
+        })
+    };
 
     // Spawn CTRL+C handler
     {
         let tx = tx.clone();
         tokio::spawn(async move {
             if signal::ctrl_c().await.is_ok() {
-                let _ = tx.send(Event::Shutdown);
+                let _ = tx.send(Event::Shutdown).await;
             }
         });
     }
@@ -530,5 +578,64 @@ async fn main() {
         }
     }
 
+    // Signal the ZMQ thread to stop and wait for it
+    shutdown_flag.store(true, Ordering::Relaxed);
+    info!("Waiting for ZMQ thread to exit...");
+    if let Err(e) = zmq_handle.join() {
+        error!("ZMQ thread panicked: {:?}", e);
+    }
+
     info!("telegram_zmq_bot has shut down gracefully");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii() {
+        assert_eq!(truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate_str("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_empty() {
+        assert_eq!(truncate_str("", 5), "");
+    }
+
+    #[test]
+    fn truncate_emoji() {
+        // Each emoji is one char but multiple bytes
+        let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}"; // 5 emojis
+        let result = truncate_str(s, 3);
+        assert_eq!(result, "\u{1F600}\u{1F601}\u{1F602}");
+    }
+
+    #[test]
+    fn truncate_mixed_utf8() {
+        let s = "aBC\u{00E9}\u{00E8}fg"; // a B C é è f g
+        let result = truncate_str(s, 4);
+        assert_eq!(result, "aBC\u{00E9}");
+    }
+
+    #[test]
+    fn truncate_exact_boundary() {
+        assert_eq!(truncate_str("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_zero() {
+        assert_eq!(truncate_str("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_cjk() {
+        let s = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // 你好世界
+        let result = truncate_str(s, 2);
+        assert_eq!(result, "\u{4F60}\u{597D}");
+    }
 }
