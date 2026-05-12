@@ -1,11 +1,12 @@
-use teloxide::{prelude::*, types::InputFile};
+use teloxide::{prelude::*, types::{InputFile, InputMedia, InputMediaPhoto}};
 use serde::Deserialize;
 use log::{error, info, warn, trace, Level, LevelFilter, Metadata, Record};
 use chrono::Local;
-use std::{fs, path::PathBuf, collections::HashMap, thread};
+use std::{fs, path::PathBuf, collections::{HashMap, BTreeMap}, thread};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::{signal, sync::{mpsc, Notify}, time};
+use std::time::{Duration, Instant};
+use tokio::{signal, sync::{mpsc, Mutex, Notify}, time};
 
 /// Safely truncate a string to at most `max_chars` characters,
 /// never splitting a multi-byte UTF-8 character.
@@ -120,6 +121,16 @@ struct ZmqMessage {
     text: String,
     #[serde(default)]
     image_path: Option<String>,
+    /// Telegram album fields (Option B). When all three are present and
+    /// media_group_size is in 2..=10, this message is batched with siblings
+    /// sharing the same media_group_id into a single sendMediaGroup call.
+    /// Missing or out-of-range values fall back to single-photo delivery.
+    #[serde(default)]
+    media_group_id: Option<String>,
+    #[serde(default)]
+    media_group_size: Option<u32>,
+    #[serde(default)]
+    media_group_index: Option<u32>,
 }
 
 /// Events sent to the central channel
@@ -127,10 +138,283 @@ enum Event {
     Zmq(Vec<Vec<u8>>),
 }
 
+// ─── Telegram album batcher (sendMediaGroup) ────────────────────────────────
+//
+// When incoming ZmqMessages carry (media_group_id, media_group_size,
+// media_group_index), they are batched per (group_id, chat_id) until all
+// expected photos have arrived OR a deadline elapses. The complete batch
+// is flushed via bot.send_media_group(...) so Telegram delivers it as a
+// single album. A periodic sweeper task flushes timed-out batches; one-photo
+// timeout flushes degrade to send_photo (Telegram albums require 2..=10).
+//
+// Telegram album constraints applied:
+//   - size must be in 2..=10 to attempt media_group; otherwise legacy send_photo
+//   - caption is attached ONLY to the index=0 photo; others are empty
+//   - photos sorted by index before building Vec<InputMedia>
+//
+// Backwards-compat: messages without media_group_id take the existing
+// send_to_chat_with_image_retry path unchanged.
+
+const BATCH_DEADLINE_SECS: u64 = 5;
+const BATCH_SWEEP_INTERVAL_MS: u64 = 1000;
+const TELEGRAM_ALBUM_MIN: u32 = 2;
+const TELEGRAM_ALBUM_MAX: u32 = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BatchKey {
+    group_id: String,
+    chat_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PhotoEntry {
+    index: u32,
+    image_path: String,
+    caption: String,
+}
+
+/// Pure outcome of flushing a MediaGroupBuf. Extracted from `flush_batch` so
+/// the sort/branching/caption-attachment logic is unit-testable without any
+/// teloxide/Telegram API dependency.
+#[derive(Debug, PartialEq, Eq)]
+enum FlushDecision {
+    Empty,
+    SinglePhoto { photo: PhotoEntry, chat_id: i64 },
+    Album { items: Vec<PhotoEntry>, caption_index: u32, chat_id: i64 },
+}
+
+/// Resolve a buffered batch into a FlushDecision. Caption_index is always 0 —
+/// callers/InputMedia builder are responsible for attaching the caption only
+/// to the entry whose `index == caption_index` (or to NO entry, in the partial
+/// case where index=0 never arrived).
+fn plan_flush(buf: MediaGroupBuf, chat_id: i64) -> FlushDecision {
+    // BTreeMap.into_values() iterates in key (index) order ascending.
+    let mut items: Vec<PhotoEntry> = buf.photos.into_values().collect();
+    match items.len() {
+        0 => FlushDecision::Empty,
+        1 => FlushDecision::SinglePhoto { photo: items.remove(0), chat_id },
+        _ => FlushDecision::Album { items, caption_index: 0, chat_id },
+    }
+}
+
+/// Pair each album item with an optional caption. The caption attaches ONLY to
+/// the entry whose `entry.index == caption_index` (NOT positional). When the
+/// idx=0 entry is missing (partial album), no item receives a caption — the
+/// caption is the property of the primary chart and degrades silently when the
+/// primary photo is absent.
+fn build_album_input(
+    items: &[PhotoEntry],
+    caption_index: u32,
+) -> Vec<(&PhotoEntry, Option<String>)> {
+    items
+        .iter()
+        .map(|p| {
+            let cap = if p.index == caption_index && !p.caption.is_empty() {
+                Some(p.caption.clone())
+            } else {
+                None
+            };
+            (p, cap)
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct MediaGroupBuf {
+    expected_size: u32,
+    /// Keyed by media_group_index so duplicate-index re-deliveries overwrite
+    /// (per Codex pre-impl finding: blind .len() on a Vec can flush early
+    /// with duplicates).
+    photos: BTreeMap<u32, PhotoEntry>,
+    deadline: Instant,
+}
+
+type BatcherState = Arc<Mutex<HashMap<BatchKey, MediaGroupBuf>>>;
+
+fn new_batcher() -> BatcherState {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Add a photo to the batch for (group_id, chat_id). If the batch is now
+/// complete (unique indexes == expected_size), remove and return it so the
+/// caller can flush. Otherwise leaves it in the map for the sweep task to
+/// flush on deadline.
+async fn enqueue_or_complete(
+    state: &BatcherState,
+    group_id: String,
+    chat_id: i64,
+    expected_size: u32,
+    index: u32,
+    image_path: String,
+    caption: String,
+) -> Option<MediaGroupBuf> {
+    let key = BatchKey { group_id: group_id.clone(), chat_id };
+    let mut map = state.lock().await;
+    let buf = map.entry(key.clone()).or_insert_with(|| MediaGroupBuf {
+        expected_size,
+        photos: BTreeMap::new(),
+        deadline: Instant::now() + Duration::from_secs(BATCH_DEADLINE_SECS),
+    });
+    buf.photos.insert(index, PhotoEntry { index, image_path, caption });
+    let collected = buf.photos.len() as u32;
+    if collected >= buf.expected_size {
+        // Complete — remove and return for immediate flush.
+        info!(
+            "Batcher: group={} chat={} complete ({}/{}), flushing as album",
+            group_id, chat_id, collected, buf.expected_size
+        );
+        map.remove(&key)
+    } else {
+        info!(
+            "Batcher: group={} chat={} queued idx={} ({}/{})",
+            group_id, chat_id, index, collected, buf.expected_size
+        );
+        None
+    }
+}
+
+/// Drain expired entries from the batcher and return them for flushing.
+async fn drain_expired(state: &BatcherState) -> Vec<(BatchKey, MediaGroupBuf)> {
+    let now = Instant::now();
+    let mut map = state.lock().await;
+    let expired_keys: Vec<BatchKey> = map
+        .iter()
+        .filter(|(_, buf)| buf.deadline <= now)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut out = Vec::with_capacity(expired_keys.len());
+    for k in expired_keys {
+        if let Some(buf) = map.remove(&k) {
+            info!(
+                "Batcher: group={} chat={} TIMEOUT ({} photos collected, expected {})",
+                k.group_id, k.chat_id, buf.photos.len(), buf.expected_size
+            );
+            out.push((k, buf));
+        }
+    }
+    out
+}
+
+/// Flush a MediaGroupBuf: sendMediaGroup when 2..=10 unique photos, otherwise
+/// degrade to single send_photo (or skip if 0 photos). Photos sorted by index
+/// ascending; caption attached only to index=0.
+async fn flush_batch(bot: &Bot, chat_id: i64, buf: MediaGroupBuf) {
+    let chat = ChatId(chat_id);
+
+    match plan_flush(buf, chat_id) {
+        FlushDecision::Empty => {
+            warn!("Batcher: flush called with 0 photos; nothing to send");
+        }
+        FlushDecision::SinglePhoto { photo, .. } => {
+            info!("Batcher: chat={} single-photo fallback ({})", chat_id, photo.image_path);
+            send_to_chat_with_image_retry(bot, chat, &photo.caption, &photo.image_path).await;
+        }
+        FlushDecision::Album { items, caption_index, .. } => {
+            let n = items.len() as u32;
+            if n > TELEGRAM_ALBUM_MAX {
+                warn!(
+                    "Batcher: chat={} batch of {} exceeds Telegram album max {}; sending first {} only",
+                    chat_id, n, TELEGRAM_ALBUM_MAX, TELEGRAM_ALBUM_MAX
+                );
+            }
+
+            let paired = build_album_input(&items, caption_index);
+            let mut media: Vec<InputMedia> =
+                Vec::with_capacity(paired.len().min(TELEGRAM_ALBUM_MAX as usize));
+            for (i, (entry, caption_opt)) in paired.iter().enumerate() {
+                if i >= TELEGRAM_ALBUM_MAX as usize {
+                    break;
+                }
+                let p = PathBuf::from(&entry.image_path);
+                if !p.exists() {
+                    error!("Batcher: image file missing at flush time: {}", entry.image_path);
+                    continue;
+                }
+                let input_file = InputFile::file(p);
+                let mut photo = InputMediaPhoto::new(input_file);
+                if let Some(cap) = caption_opt {
+                    photo = photo.caption(cap.clone());
+                }
+                media.push(InputMedia::Photo(photo));
+            }
+
+            if media.len() < TELEGRAM_ALBUM_MIN as usize {
+                if media.len() == 1 {
+                    if let Some(entry) = items
+                        .iter()
+                        .find(|e| PathBuf::from(&e.image_path).exists())
+                    {
+                        send_to_chat_with_image_retry(
+                            bot,
+                            chat,
+                            &entry.caption,
+                            &entry.image_path,
+                        )
+                        .await;
+                    }
+                } else {
+                    error!(
+                        "Batcher: chat={} no valid photos after file existence filtering",
+                        chat_id
+                    );
+                }
+                return;
+            }
+
+            send_media_group_with_retry(bot, chat, media).await;
+        }
+    }
+}
+
+/// Send an album with the same 3-retry exponential backoff as send_photo.
+async fn send_media_group_with_retry(bot: &Bot, chat: ChatId, media: Vec<InputMedia>) {
+    const MAX_RETRIES: u8 = 3;
+    const BASE_DELAY_MS: u64 = 500;
+    let n = media.len();
+    for attempt in 0..MAX_RETRIES {
+        let m = media.clone();
+        match time::timeout(time::Duration::from_secs(60), bot.send_media_group(chat, m)).await {
+            Ok(Ok(_)) => {
+                info!("Sent media group to {} with {} photos", chat, n);
+                return;
+            }
+            Ok(Err(err)) => {
+                if attempt < MAX_RETRIES - 1 {
+                    let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32));
+                    warn!(
+                        "Failed to send media group to {} (attempt {}/{}): {:?}, retrying in {}ms",
+                        chat, attempt + 1, MAX_RETRIES, err, delay
+                    );
+                    time::sleep(time::Duration::from_millis(delay)).await;
+                } else {
+                    error!(
+                        "Failed to send media group to {} after {} attempts: {:?}",
+                        chat, MAX_RETRIES, err
+                    );
+                }
+            }
+            Err(_elapsed) => {
+                if attempt < MAX_RETRIES - 1 {
+                    warn!(
+                        "Timeout sending media group to {} (attempt {}/{}), retrying",
+                        chat, attempt + 1, MAX_RETRIES
+                    );
+                } else {
+                    error!(
+                        "Timeout sending media group to {} after {} attempts",
+                        chat, MAX_RETRIES
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Parse and handle raw ZMQ frames
 async fn handle_zmq_frames(
     bot: Bot,
     settings: config::TelegramSettings,
+    batcher: BatcherState,
     frames: Vec<Vec<u8>>,
 ) {
     if frames.len() < 2 {
@@ -165,7 +449,7 @@ async fn handle_zmq_frames(
                         match serde_json::from_value::<ZmqMessage>(arr[2].clone()) {
                             Ok(cmd) => {
                                 info!("ZMQ: Successfully extracted command: {:?}", cmd);
-                                process_zmq_message(&bot, &settings, cmd).await
+                                process_zmq_message(&bot, &settings, &batcher, cmd).await
                             },
                             Err(err) => error!("Invalid command structure: {:?}", err),
                         }
@@ -187,10 +471,65 @@ async fn handle_zmq_frames(
 async fn process_zmq_message(
     bot: &Bot,
     settings: &config::TelegramSettings,
+    batcher: &BatcherState,
     cmd: ZmqMessage,
 ) {
     info!("Processing ZMQ message: {:?}", cmd);
 
+    // ── Album batching path ──────────────────────────────────────────────────
+    // When all three media_group_* fields are present AND size is in the
+    // Telegram-supported range 2..=10, route each photo through the batcher.
+    // Anything else (missing fields, invalid size) falls through to the
+    // existing per-message send_photo path.
+    let album_valid = cmd.media_group_id.is_some()
+        && cmd.media_group_size
+            .map(|s| (TELEGRAM_ALBUM_MIN..=TELEGRAM_ALBUM_MAX).contains(&s))
+            .unwrap_or(false)
+        && cmd.media_group_index.is_some()
+        && cmd.image_path.is_some();
+    if album_valid {
+        let group_id = cmd.media_group_id.clone().expect("checked");
+        let size = cmd.media_group_size.expect("checked");
+        let index = cmd.media_group_index.expect("checked");
+        let image_path = cmd.image_path.clone().expect("checked");
+        let caption = cmd.text.clone();
+
+        // Resolve the chat list (single chat_id OR subscriber_list expansion)
+        let chat_targets: Vec<i64> = if let Some(cid) = cmd.chat_id {
+            vec![cid]
+        } else if let Some(list_name) = cmd.subscriber_list.as_ref() {
+            if let Some(subs) = settings.subscriber_lists.get(list_name) {
+                subs.iter().copied().collect()
+            } else {
+                warn!("Subscriber list '{}' not found; using owner_chat_id", list_name);
+                vec![settings.owner_chat_id]
+            }
+        } else {
+            vec![settings.owner_chat_id]
+        };
+
+        // For each chat, enqueue into its own per-(group_id, chat_id) batch.
+        // Completed batches are flushed immediately; partial batches wait for
+        // their siblings or the sweep task's deadline check.
+        for chat_id in chat_targets {
+            let maybe_complete = enqueue_or_complete(
+                batcher,
+                group_id.clone(),
+                chat_id,
+                size,
+                index,
+                image_path.clone(),
+                caption.clone(),
+            )
+            .await;
+            if let Some(buf) = maybe_complete {
+                flush_batch(bot, chat_id, buf).await;
+            }
+        }
+        return;
+    }
+
+    // ── Legacy single-message path (unchanged) ───────────────────────────────
     if let Some(chat_id) = cmd.chat_id {
         if let Some(img_path) = &cmd.image_path {
             send_to_chat_with_image_retry(bot, ChatId(chat_id), &cmd.text, img_path).await;
@@ -436,6 +775,31 @@ async fn main() {
     // Create bot
     let bot = Bot::new(&settings.bot_token);
 
+    // Telegram album batcher: shared across all incoming-message handlers.
+    // Photos arriving with the same media_group_id accumulate here until
+    // complete or the deadline elapses, then flush as a single sendMediaGroup.
+    let batcher: BatcherState = new_batcher();
+
+    // Periodic sweeper: every BATCH_SWEEP_INTERVAL_MS, scan the batcher for
+    // entries past their deadline and flush whatever photos arrived. Runs for
+    // the lifetime of the process; tokio shutdown is implicit at process exit.
+    {
+        let bot = bot.clone();
+        let batcher = batcher.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                time::interval(time::Duration::from_millis(BATCH_SWEEP_INTERVAL_MS));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                let expired = drain_expired(&batcher).await;
+                for (key, buf) in expired {
+                    flush_batch(&bot, key.chat_id, buf).await;
+                }
+            }
+        });
+    }
+
     // Central event channel (bounded to prevent unbounded memory growth)
     let (tx, mut rx) = mpsc::channel::<Event>(256);
 
@@ -602,8 +966,9 @@ async fn main() {
                     Some(Event::Zmq(frames)) => {
                         let bot = bot.clone();
                         let settings = settings.clone();
+                        let batcher = batcher.clone();
                         tokio::spawn(async move {
-                            handle_zmq_frames(bot, settings, frames).await;
+                            handle_zmq_frames(bot, settings, batcher, frames).await;
                         });
                     }
                     None => {
@@ -682,5 +1047,195 @@ mod tests {
         let s = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // 你好世界
         let result = truncate_str(s, 2);
         assert_eq!(result, "\u{4F60}\u{597D}");
+    }
+
+    // ── Batcher (G3b) tests ─────────────────────────────────────────────────
+    use std::collections::BTreeMap;
+
+    fn mk_photo(index: u32, caption: &str) -> PhotoEntry {
+        PhotoEntry {
+            index,
+            image_path: format!("/tmp/img_{}.png", index),
+            caption: caption.to_string(),
+        }
+    }
+
+    fn mk_buf(expected: u32, deadline: Instant) -> MediaGroupBuf {
+        MediaGroupBuf {
+            expected_size: expected,
+            photos: BTreeMap::new(),
+            deadline,
+        }
+    }
+
+    // 6. Completion semantics: inserting `expected_size` unique indexes via the
+    //    raw API mirrors what `enqueue_or_complete` would observe right before
+    //    it removes the entry.
+    #[test]
+    fn enqueue_triggers_completion_when_size_reached() {
+        let mut buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(0, mk_photo(0, "primary"));
+        buf.photos.insert(1, mk_photo(1, ""));
+        assert_eq!(buf.photos.len() as u32, buf.expected_size);
+    }
+
+    // 7. BTreeMap.insert overwrites on duplicate key — preserves
+    //    "duplicate-index re-deliveries replace, not append".
+    #[test]
+    fn duplicate_index_replaces_not_appends() {
+        let mut buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(0, mk_photo(0, "first"));
+        buf.photos.insert(0, mk_photo(0, "second"));
+        assert_eq!(buf.photos.len(), 1);
+        assert_eq!(buf.photos.get(&0).unwrap().caption, "second");
+    }
+
+    // 8. drain_expired selects only entries whose deadline <= now.
+    #[tokio::test]
+    async fn drain_expired_returns_only_past_deadline_keys() {
+        let state: BatcherState = new_batcher();
+        {
+            let mut map = state.lock().await;
+            map.insert(
+                BatchKey { group_id: "past".to_string(), chat_id: 1 },
+                mk_buf(2, Instant::now() - Duration::from_secs(1)),
+            );
+            map.insert(
+                BatchKey { group_id: "future".to_string(), chat_id: 1 },
+                mk_buf(2, Instant::now() + Duration::from_secs(30)),
+            );
+        }
+        let drained = drain_expired(&state).await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0.group_id, "past");
+        // Map still contains the future entry.
+        let map = state.lock().await;
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&BatchKey { group_id: "future".to_string(), chat_id: 1 }));
+    }
+
+    // 9. Empty buffer → Empty decision.
+    #[test]
+    fn plan_flush_empty_returns_empty() {
+        let buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        assert_eq!(plan_flush(buf, 42), FlushDecision::Empty);
+    }
+
+    // 10. Complete album: items in index order, caption_index=0, chat_id passthrough.
+    #[test]
+    fn plan_flush_complete_emits_sorted_album() {
+        let mut buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        // Insert out of order to verify BTreeMap sort.
+        buf.photos.insert(1, mk_photo(1, ""));
+        buf.photos.insert(0, mk_photo(0, "primary"));
+        match plan_flush(buf, 42) {
+            FlushDecision::Album { items, caption_index, chat_id } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].index, 0);
+                assert_eq!(items[1].index, 1);
+                assert_eq!(caption_index, 0);
+                assert_eq!(chat_id, 42);
+            }
+            other => panic!("expected Album, got {:?}", other),
+        }
+    }
+
+    // 11. Partial album (expected_size=3, only 2 collected) still planned as Album
+    //     when len >= 2, in sorted order.
+    #[test]
+    fn plan_flush_partial_with_multiple_photos_emits_sorted_album() {
+        let mut buf = mk_buf(3, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(2, mk_photo(2, ""));
+        buf.photos.insert(0, mk_photo(0, "primary"));
+        match plan_flush(buf, 7) {
+            FlushDecision::Album { items, caption_index, chat_id } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].index, 0);
+                assert_eq!(items[1].index, 2);
+                assert_eq!(caption_index, 0);
+                assert_eq!(chat_id, 7);
+            }
+            other => panic!("expected Album, got {:?}", other),
+        }
+    }
+
+    // 12. Single photo → SinglePhoto with chat_id passthrough.
+    #[test]
+    fn plan_flush_single_photo_returns_single_photo() {
+        let mut buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(0, mk_photo(0, "lonely"));
+        match plan_flush(buf, 99) {
+            FlushDecision::SinglePhoto { photo, chat_id } => {
+                assert_eq!(photo.index, 0);
+                assert_eq!(photo.caption, "lonely");
+                assert_eq!(chat_id, 99);
+            }
+            other => panic!("expected SinglePhoto, got {:?}", other),
+        }
+    }
+
+    // 13. Boundary: deadline == now is considered expired (<= semantics).
+    #[tokio::test]
+    async fn drain_expired_boundary_exactly_now() {
+        let state: BatcherState = new_batcher();
+        let now = Instant::now();
+        {
+            let mut map = state.lock().await;
+            map.insert(
+                BatchKey { group_id: "exactly-now".to_string(), chat_id: 1 },
+                mk_buf(2, now),
+            );
+        }
+        // Ensure now() inside drain_expired is >= the stored deadline.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let drained = drain_expired(&state).await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0.group_id, "exactly-now");
+    }
+
+    // 14. Caption attaches ONLY to the entry whose index == caption_index.
+    #[test]
+    fn plan_flush_caption_only_attached_to_index_zero() {
+        let items = vec![mk_photo(0, "primary"), mk_photo(1, "wide")];
+        let paired = build_album_input(&items, 0);
+        assert_eq!(paired.len(), 2);
+        assert_eq!(paired[0].1.as_deref(), Some("primary"));
+        assert_eq!(paired[1].1, None);
+    }
+
+    // 15. Duplicate index after partial completion: replacement preserves
+    //     completion state (len == expected_size, second caption wins).
+    #[test]
+    fn duplicate_index_completion_interaction() {
+        let mut buf = mk_buf(2, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(0, mk_photo(0, "first"));
+        buf.photos.insert(1, mk_photo(1, ""));
+        // Re-delivery of idx=0 with a different caption — must not bump len.
+        buf.photos.insert(0, mk_photo(0, "redelivered"));
+        assert_eq!(buf.photos.len() as u32, buf.expected_size);
+        assert_eq!(buf.photos.get(&0).unwrap().caption, "redelivered");
+    }
+
+    // 16. Partial album where idx=0 is missing → caption attaches nowhere.
+    #[test]
+    fn plan_flush_partial_album_no_index_zero_caption_nowhere() {
+        let mut buf = mk_buf(3, Instant::now() + Duration::from_secs(5));
+        buf.photos.insert(1, mk_photo(1, "wide"));
+        buf.photos.insert(2, mk_photo(2, "wider"));
+        match plan_flush(buf, 5) {
+            FlushDecision::Album { items, caption_index, chat_id } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].index, 1);
+                assert_eq!(items[1].index, 2);
+                assert_eq!(caption_index, 0);
+                assert_eq!(chat_id, 5);
+                let paired = build_album_input(&items, caption_index);
+                // No idx==0 present → every pair has None caption.
+                for (_, cap) in &paired {
+                    assert!(cap.is_none(), "expected no caption on partial album");
+                }
+            }
+            other => panic!("expected Album, got {:?}", other),
+        }
     }
 }
