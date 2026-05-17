@@ -944,10 +944,22 @@ async fn main() {
         });
     }
 
-    // Telegram command dispatcher (no internal CTRL+C handler)
-    let handler = Update::filter_message()
-        .filter_command::<commands::Command>()
-        .endpoint(commands::handle);
+    // Telegram command dispatcher (no internal CTRL+C handler).
+    // Two branches: regular messages (private/group chats) and channel posts
+    // (broadcast channels). Channel posts arrive on update.channel_post, not
+    // update.message, so they need their own filter — but commands::handle
+    // accepts either since both are teloxide `Message`s.
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter_command::<commands::Command>()
+                .endpoint(commands::handle),
+        )
+        .branch(
+            Update::filter_channel_post()
+                .filter_command::<commands::Command>()
+                .endpoint(commands::handle),
+        );
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler).build();
     let dispatch_shutdown = dispatcher.shutdown_token();
     let dispatch_task = tokio::spawn(async move {
