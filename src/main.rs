@@ -1,8 +1,10 @@
 use teloxide::{prelude::*, types::{InputFile, InputMedia, InputMediaPhoto}};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use log::{error, info, warn, trace, Level, LevelFilter, Metadata, Record};
 use chrono::Local;
-use std::{fs, path::PathBuf, collections::{HashMap, BTreeMap}, thread};
+use std::{fs, path::{Path, PathBuf}, collections::{HashMap, BTreeMap}, thread};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +37,8 @@ mod config {
         pub subscriber_lists: HashMap<String, Vec<i64>>,
         #[serde(default = "default_zmq_endpoint")]
         pub zmq_endpoint: String,
+        #[serde(default)]
+        pub delivery_receipts_path: Option<PathBuf>,
     }
 
     /// Default ZMQ endpoint if none specified
@@ -121,6 +125,10 @@ struct ZmqMessage {
     text: String,
     #[serde(default)]
     image_path: Option<String>,
+    /// Stable identity for acknowledged P8 operations delivery. Existing
+    /// senders omit this field and retain the fire-and-forget behavior.
+    #[serde(default)]
+    delivery_id: Option<String>,
     /// Telegram album fields (Option B). When all three are present and
     /// media_group_size is in 2..=10, this message is batched with siblings
     /// sharing the same media_group_id into a single sendMediaGroup call.
@@ -136,6 +144,157 @@ struct ZmqMessage {
 /// Events sent to the central channel
 enum Event {
     Zmq(Vec<Vec<u8>>),
+}
+
+#[derive(Clone, Debug)]
+struct OutboundReply {
+    target: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DeliveryReceipt {
+    delivery_id: String,
+    chat_id: i64,
+    text: String,
+    delivered_at_ms: i64,
+}
+
+struct DeliveryReceiptStore {
+    path: PathBuf,
+    file: File,
+    delivered: HashMap<String, DeliveryReceipt>,
+}
+
+impl DeliveryReceiptStore {
+    fn open(path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create delivery receipt directory: {error}"))?;
+        }
+        recover_delivery_receipt_tail(&path)?;
+        let mut delivered = HashMap::new();
+        if path.exists() {
+            let file = File::open(&path)
+                .map_err(|error| format!("open {}: {error}", path.display()))?;
+            for (index, line) in BufReader::new(file).lines().enumerate() {
+                let line = line.map_err(|error| {
+                    format!("read {} line {}: {error}", path.display(), index + 1)
+                })?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let receipt: DeliveryReceipt = serde_json::from_str(&line).map_err(|error| {
+                    format!("parse {} line {}: {error}", path.display(), index + 1)
+                })?;
+                delivered.insert(receipt.delivery_id.clone(), receipt);
+            }
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("open {} for append: {error}", path.display()))?;
+        sync_receipt_directory(&path)?;
+        Ok(Self { path, file, delivered })
+    }
+
+    fn matching(&self, delivery_id: &str, chat_id: i64, text: &str) -> Option<bool> {
+        self.delivered
+            .get(delivery_id)
+            .map(|receipt| receipt.chat_id == chat_id && receipt.text == text)
+    }
+
+    fn record(&mut self, receipt: DeliveryReceipt) -> Result<(), String> {
+        serde_json::to_writer(&mut self.file, &receipt)
+            .map_err(|error| format!("serialize delivery receipt: {error}"))?;
+        self.file
+            .write_all(b"\n")
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_data())
+            .map_err(|error| format!("sync delivery receipt {}: {error}", self.path.display()))?;
+        self.delivered.insert(receipt.delivery_id.clone(), receipt);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_receipt_directory(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync receipt directory {}: {error}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_receipt_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn recover_delivery_receipt_tail(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("open {} for receipt recovery: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {} for receipt recovery: {error}", path.display()))?;
+    if bytes.last().is_some_and(|byte| *byte != b'\n') {
+        let retained = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        file.set_len(retained as u64)
+            .and_then(|()| file.seek(SeekFrom::Start(retained as u64)).map(|_| ()))
+            .and_then(|()| file.sync_data())
+            .map_err(|error| format!("recover receipt tail {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+type ReceiptState = Arc<Mutex<DeliveryReceiptStore>>;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryAckStatus {
+    Delivered,
+    RetryableFailure,
+    PermanentFailure,
+}
+
+#[derive(Debug, Serialize)]
+struct DeliveryAck {
+    delivery_id: String,
+    status: DeliveryAckStatus,
+    detail: Option<String>,
+}
+
+fn delivery_receipts_path(settings: &config::TelegramSettings) -> Result<PathBuf, String> {
+    if let Some(path) = &settings.delivery_receipts_path {
+        return Ok(path.clone());
+    }
+    let home = dirs::home_dir()
+        .ok_or_else(|| "Unable to determine home directory for delivery receipts".to_string())?;
+    Ok(home.join(".corky").join("telegram-delivery-receipts.jsonl"))
+}
+
+fn current_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn delivery_ack_payload(ack: &DeliveryAck) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&serde_json::json!(["ok", "delivery_ack", ack]))
+        .map_err(|error| format!("serialize delivery acknowledgement: {error}"))
 }
 
 // ─── Telegram album batcher (sendMediaGroup) ────────────────────────────────
@@ -415,6 +574,8 @@ async fn handle_zmq_frames(
     bot: Bot,
     settings: config::TelegramSettings,
     batcher: BatcherState,
+    receipts: ReceiptState,
+    replies: std::sync::mpsc::Sender<OutboundReply>,
     frames: Vec<Vec<u8>>,
 ) {
     if frames.len() < 2 {
@@ -449,7 +610,28 @@ async fn handle_zmq_frames(
                         match serde_json::from_value::<ZmqMessage>(arr[2].clone()) {
                             Ok(cmd) => {
                                 info!("ZMQ: Successfully extracted command: {:?}", cmd);
-                                process_zmq_message(&bot, &settings, &batcher, cmd).await
+                                if cmd.delivery_id.is_some() {
+                                    let ack = process_acknowledged_message(
+                                        &bot,
+                                        &settings,
+                                        &receipts,
+                                        &cmd,
+                                    )
+                                    .await;
+                                    match delivery_ack_payload(&ack) {
+                                        Ok(payload) => {
+                                            if replies.send(OutboundReply {
+                                                target: frames[0].clone(),
+                                                payload,
+                                            }).is_err() {
+                                                error!("ZMQ: reply channel closed before delivery acknowledgement");
+                                            }
+                                        }
+                                        Err(error) => error!("ZMQ: {error}"),
+                                    }
+                                } else {
+                                    process_zmq_message(&bot, &settings, &batcher, cmd).await
+                                }
                             },
                             Err(err) => error!("Invalid command structure: {:?}", err),
                         }
@@ -464,6 +646,80 @@ async fn handle_zmq_frames(
         }
     } else {
         error!("Non-UTF8 payload in message");
+    }
+}
+
+async fn process_acknowledged_message(
+    bot: &Bot,
+    settings: &config::TelegramSettings,
+    receipts: &ReceiptState,
+    cmd: &ZmqMessage,
+) -> DeliveryAck {
+    let delivery_id = cmd.delivery_id.clone().unwrap_or_default();
+    if delivery_id.is_empty() {
+        return DeliveryAck {
+            delivery_id,
+            status: DeliveryAckStatus::PermanentFailure,
+            detail: Some("delivery_id must not be empty".to_string()),
+        };
+    }
+    if cmd.image_path.is_some() || cmd.subscriber_list.is_some() {
+        return DeliveryAck {
+            delivery_id,
+            status: DeliveryAckStatus::PermanentFailure,
+            detail: Some(
+                "acknowledged delivery supports one text chat; images and subscriber lists remain legacy"
+                    .to_string(),
+            ),
+        };
+    }
+    let chat_id = cmd.chat_id.unwrap_or(settings.owner_chat_id);
+    // Serialize each acknowledged identity through the receipt store. This
+    // prevents two concurrent redeliveries from both reaching Telegram.
+    let mut store = receipts.lock().await;
+    match store.matching(&delivery_id, chat_id, &cmd.text) {
+        Some(true) => {
+            return DeliveryAck {
+                delivery_id,
+                status: DeliveryAckStatus::Delivered,
+                detail: Some("already delivered".to_string()),
+            };
+        }
+        Some(false) => {
+            return DeliveryAck {
+                delivery_id,
+                status: DeliveryAckStatus::PermanentFailure,
+                detail: Some("delivery_id reused with different content".to_string()),
+            };
+        }
+        None => {}
+    }
+    if let Err(error) = send_to_chat_with_retry_result(bot, ChatId(chat_id), &cmd.text).await {
+        return DeliveryAck {
+            delivery_id,
+            status: DeliveryAckStatus::RetryableFailure,
+            detail: Some(error),
+        };
+    }
+    let receipt = DeliveryReceipt {
+        delivery_id: delivery_id.clone(),
+        chat_id,
+        text: cmd.text.clone(),
+        delivered_at_ms: current_epoch_ms(),
+    };
+    match store.record(receipt) {
+        Ok(()) => DeliveryAck {
+            delivery_id,
+            status: DeliveryAckStatus::Delivered,
+            detail: None,
+        },
+        Err(error) => DeliveryAck {
+            delivery_id,
+            status: DeliveryAckStatus::RetryableFailure,
+            detail: Some(format!(
+                "Telegram accepted message but receipt persistence failed; outcome uncertain: {error}"
+            )),
+        },
     }
 }
 
@@ -569,9 +825,18 @@ async fn process_zmq_message(
 
 /// Send a message with retry logic for resilience
 async fn send_to_chat_with_retry(bot: &Bot, chat: ChatId, text: &str) {
+    let _ = send_to_chat_with_retry_result(bot, chat, text).await;
+}
+
+async fn send_to_chat_with_retry_result(
+    bot: &Bot,
+    chat: ChatId,
+    text: &str,
+) -> Result<(), String> {
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u64 = 500;
-    
+    let mut last_error = "Telegram delivery failed".to_string();
+
     for attempt in 0..MAX_RETRIES {
         match time::timeout(
             time::Duration::from_secs(30),
@@ -579,9 +844,10 @@ async fn send_to_chat_with_retry(bot: &Bot, chat: ChatId, text: &str) {
         ).await {
             Ok(Ok(_)) => {
                 info!("Sent message to {}: \"{}\"", chat, if text.len() > 30 { format!("{}...", truncate_str(text, 30)) } else { text.to_string() });
-                return;
+                return Ok(());
             }
             Ok(Err(err)) => {
+                last_error = format!("Telegram API error: {err}");
                 if attempt < MAX_RETRIES - 1 {
                     let delay = BASE_DELAY_MS * (2_u64.pow(attempt as u32));
                     warn!("Failed to send to {} (attempt {}/{}): {:?}, retrying in {}ms",
@@ -592,6 +858,7 @@ async fn send_to_chat_with_retry(bot: &Bot, chat: ChatId, text: &str) {
                 }
             }
             Err(_elapsed) => {
+                last_error = "Telegram API timeout".to_string();
                 if attempt < MAX_RETRIES - 1 {
                     warn!("Timeout sending to {} (attempt {}/{}), retrying", chat, attempt + 1, MAX_RETRIES);
                 } else {
@@ -600,6 +867,7 @@ async fn send_to_chat_with_retry(bot: &Bot, chat: ChatId, text: &str) {
             }
         }
     }
+    Err(last_error)
 }
 
 /// Send a message with an image with retry logic for resilience
@@ -774,6 +1042,20 @@ async fn main() {
 
     // Create bot
     let bot = Bot::new(&settings.bot_token);
+    let receipt_path = match delivery_receipts_path(&settings) {
+        Ok(path) => path,
+        Err(error) => {
+            error!("Cannot configure durable delivery receipts: {error}");
+            return;
+        }
+    };
+    let receipts = match DeliveryReceiptStore::open(receipt_path) {
+        Ok(store) => Arc::new(Mutex::new(store)),
+        Err(error) => {
+            error!("Cannot open durable delivery receipts: {error}");
+            return;
+        }
+    };
 
     // Telegram album batcher: shared across all incoming-message handlers.
     // Photos arriving with the same media_group_id accumulate here until
@@ -802,6 +1084,7 @@ async fn main() {
 
     // Central event channel (bounded to prevent unbounded memory growth)
     let (tx, mut rx) = mpsc::channel::<Event>(256);
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<OutboundReply>();
 
     // Shutdown flag shared with the ZMQ thread
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -867,8 +1150,19 @@ async fn main() {
 
                 // Inner polling loop - runs until max consecutive errors or shutdown
                 while consecutive_errors < max_consecutive_errors && !shutdown.load(Ordering::Acquire) {
-                    // Poll with timeout (5 seconds - allows for periodic health checks)
-                    match zmq::poll(&mut items, 5000) {
+                    while let Ok(reply) = reply_rx.try_recv() {
+                        match socket.send_multipart(
+                            [reply.target.as_slice(), reply.payload.as_slice()],
+                            zmq::DONTWAIT,
+                        ) {
+                            Ok(()) => {}
+                            Err(error) => {
+                                error!("ZMQ: failed to send delivery acknowledgement: {error}");
+                            }
+                        }
+                    }
+                    // Short poll keeps delivery acknowledgements and shutdown responsive.
+                    match zmq::poll(&mut items, 100) {
                         Ok(0) => {
                             // No events, just a timeout
                             trace!("ZMQ: Poll timeout, connection still alive");
@@ -979,8 +1273,17 @@ async fn main() {
                         let bot = bot.clone();
                         let settings = settings.clone();
                         let batcher = batcher.clone();
+                        let receipts = receipts.clone();
+                        let replies = reply_tx.clone();
                         tokio::spawn(async move {
-                            handle_zmq_frames(bot, settings, batcher, frames).await;
+                            handle_zmq_frames(
+                                bot,
+                                settings,
+                                batcher,
+                                receipts,
+                                replies,
+                                frames,
+                            ).await;
                         });
                     }
                     None => {
@@ -1249,5 +1552,51 @@ mod tests {
             }
             other => panic!("expected Album, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn delivery_receipt_replay_deduplicates_and_binds_content() {
+        let root = std::env::temp_dir().join(format!(
+            "corky-telegram-receipts-{}-{}",
+            std::process::id(),
+            current_epoch_ms()
+        ));
+        let path = root.join("receipts.jsonl");
+        {
+            let mut store = DeliveryReceiptStore::open(path.clone()).unwrap();
+            store
+                .record(DeliveryReceipt {
+                    delivery_id: "delivery-1".to_string(),
+                    chat_id: 7,
+                    text: "critical page".to_string(),
+                    delivered_at_ms: 10,
+                })
+                .unwrap();
+        }
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"{\"delivery_id\":\"interrupted").unwrap();
+            file.sync_data().unwrap();
+        }
+        let store = DeliveryReceiptStore::open(path).unwrap();
+        assert_eq!(store.matching("delivery-1", 7, "critical page"), Some(true));
+        assert_eq!(store.matching("delivery-1", 7, "changed"), Some(false));
+        assert_eq!(store.matching("unknown", 7, "critical page"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delivery_ack_envelope_is_additive_and_stable() {
+        let payload = delivery_ack_payload(&DeliveryAck {
+            delivery_id: "daily:2026-07-14:+00:00:09:00".to_string(),
+            status: DeliveryAckStatus::Delivered,
+            detail: Some("already delivered".to_string()),
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(value[0], "ok");
+        assert_eq!(value[1], "delivery_ack");
+        assert_eq!(value[2]["status"], "delivered");
+        assert_eq!(value[2]["delivery_id"], "daily:2026-07-14:+00:00:09:00");
     }
 }
